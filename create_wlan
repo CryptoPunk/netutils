@@ -304,7 +304,6 @@ while [ ! -z "$1" ]; do
 			DISABLE_DNS=1
 		  ;;
 		-?|-h|--help)
-			echo "USAGE $1 $2"
 			usage
 			exit 0
 		  ;;
