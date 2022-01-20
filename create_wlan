@@ -1,0 +1,314 @@
+#!/bin/bash
+# vim: ts=8:sw=4:tw=0:noet:
+# Creator: Max Vohra
+# License: The Unlicense
+
+SCRIPT_DIR=$(dirname $(realpath $0))
+PROG_NAME=$(basename $0)
+
+if [ -z "$(which ipcalc)" ]; then
+	echo "$PROG_NAME requires the program ipcalc. Please install before using"
+fi
+
+			
+PHY=$(iw phy |grep ^Wiphy | awk '{print $2}' | head -n1)
+AP="ap0"
+SSID="TestNet"
+PASS="MonkeyVSRobot"
+NET="192.168.77.1/24"
+NAT=$(ip route|grep ^default|awk '{print $5}')
+VERBOSE=0
+HOSTAPD_PID=
+DNSMASQ_PID=
+DISABLE_DNS=0
+DISABLE_DHCP=0
+declare -a REDIRECT
+
+function usage {
+cat <<__USAGE__
+Usage: ${PROG_NAME} [OPTION]...
+Short description of the software
+Mandatory arguments to long options are mandatory for short options too.
+
+  -l, --list-phy	List the available wifi physical layer devices and exit.
+  -p, --phy=PHY		Use the wifi physical layer device PHY to create the AP.
+			  default: ${PHY}
+
+  -a, --ap=AP		Name the AP network interface AP. 
+			  default: ${AP}
+
+  -s, --ssid=SSID	Use the specified SSID for the AP. 
+			  default: ${SSID}
+
+  -p, --password=PASS	Use password PASS to secure the AP. 
+			  default: ${PASS}
+
+  -R, --redirect=[HOST:]PORT:REDIRHOST:REDIRPORT
+			Redirect traffic going to HOST:PORT to REDIRHOST:REDIRPORT.
+			If HOST is not specified, all traffic to PORT is redirected to REDIRHOST:REDIRPORT
+			
+  -C, --cleanup		Run cleanup again, useful if interfaces get left behind after exiting uncleanly
+  -n, --net=IP/CIDR	Use the IP and CIDR range on the AP network.
+			  default: ${NET}
+  -N, --NAT=IFACE	Use IFACE as the outbound NAT interface
+			  default: ${NAT}
+      --disable-dns	Disables the DNS server
+      --disable-dhcp    Disables the DHCP server
+  -v, --verbose		Include debugging output
+  -h, --help		This help screen
+
+Examples:
+
+  ${PROG_NAME} --phy=phy0 --ssid=TestNet --password=Tester
+
+__USAGE__
+}
+
+function create_ap_iface {
+	iw phy "$PHY" interface add "$AP" type managed
+	# Randomize MAC on newly created iface to prevent collisions
+	mac_oui=$(cut -d : -f 1-3 < /sys/class/net/${AP}/address)
+	mac_addr=${mac_oui}$(hexdump -e '/1 ":%02X"' -n 3 /dev/urandom)
+
+	ip link set dev "$AP" down
+	ip link set dev "$AP" address ${mac_addr}
+	ip link set dev "$AP" up
+
+	ip addr add "$NET" dev "$AP"
+}
+
+function del_ap_iface {
+	iw dev "$AP" del
+}
+
+function nextip {
+    IP=$1
+    IP_HEX=$(printf '%.2X%.2X%.2X%.2X\n' `echo $IP | sed -e 's/\./ /g'`)
+    NEXT_IP_HEX=$(printf %.8X `echo $(( 0x$IP_HEX + 1 ))`)
+    NEXT_IP=$(printf '%d.%d.%d.%d\n' `echo $NEXT_IP_HEX | sed -r 's/(..)/0x\1 /g'`)
+    echo "$NEXT_IP"
+}
+
+function dnsmasq_config {
+host_max=$(ipcalc -b "$NET" | grep HostMax | awk '{print $2}')
+host_ip=$(ipcalc -b "$NET" | grep Address | awk '{print $2}')
+if [ "$DISABLE_DNS" -eq 1 ]; then
+	echo "port=0"
+fi
+if [ "$DISABLE_DHCP" -ne 1 ]; then
+cat <<__CONF__
+dhcp-range=$(nextip "$host_ip"),${host_max},12h
+dhcp-option=3,${host_ip}
+leasefile-ro
+__CONF__
+fi
+cat <<__CONF__
+#user=
+#group=
+interface=${AP}
+except-interface=lo
+bind-interfaces
+no-hosts
+domain=local
+# Set the gateway
+
+# Add domains which you want to force to an IP address here.
+# The example below send any host in double-click.net to a local
+# web-server.
+
+#address=/double-click.net/127.0.0.1
+__CONF__
+}
+
+function hostapd_config {
+cat <<__CONF__
+interface=${AP}
+hw_mode=g
+channel=7
+ieee80211n=1
+ieee80211ac=1
+wmm_enabled=1
+
+ssid=${SSID}
+auth_algs=1
+wpa=3
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=${PASS}
+__CONF__
+}
+
+function masquerade {
+	#iptables -F; iptables -t nat -F; iptables -t mangle -F
+	iptables -t nat -A POSTROUTING -o "${NAT}" -j MASQUERADE
+	iptables -P FORWARD DROP
+	iptables -A FORWARD -i "${NAT}" -o "${AP}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -A FORWARD -i "${AP}" -o "${NAT}" -j ACCEPT
+	
+	for spec in "${REDIRECT[@]}"; do
+		host=$(echo "$spec" | grep -Po '^[^:]+(?=:[^:]+:[^:]+:[^:]+$)')
+		if [ -z "$host" ]; then
+			host="0.0.0.0/0"
+		fi
+		port=$(echo "$spec" | grep -Po '^(?:[^:]+:)?\K[^:]+(?=:[^:]+:[^:]+$)')
+		dest=$(echo "$spec" | grep -Po '^(?:[^:]+:)?[^:]+:\K[^:]+:[^:]+$')
+		iptables -t nat -A PREROUTING -i "$AP" -p tcp -m multiport \
+			 -d "$host" --dports "$port" -j DNAT --to-destination "$dest"
+	done
+		
+	export OLD_FORWARD_STATE=$(cat /proc/sys/net/ipv4/ip_forward)
+	echo 1 > /proc/sys/net/ipv4/ip_forward
+}
+
+function unmasquerade {
+	#iptables -F; iptables -t nat -F; iptables -t mangle -F
+	iptables -t nat -D POSTROUTING -o "${NAT}" -j MASQUERADE
+	iptables -D FORWARD -i "${NAT}" -o "${AP}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+	iptables -D FORWARD -i "${AP}" -o "${NAT}" -j ACCEPT
+
+	for spec in "${REDIRECT[@]}"; do
+		host=$(echo "$spec" | grep -Po '^[^:]+(?=:[^:]+:[^:]+:[^:]+$)')
+		if [ -z "$host" ]; then
+			host="0.0.0.0/0"
+		fi
+		port=$(echo "$spec" | grep -Po '^(?:[^:]+:)?\K[^:]+(?=:[^:]+:[^:]+$)')
+		dest=$(echo "$spec" | grep -Po '^(?:[^:]+:)?[^:]+:\K[^:]+:[^:]+$')
+		iptables -t nat -D PREROUTING -i "$AP" -p tcp -m multiport \
+			 -d "$host" --dports "$port" -j DNAT --to-destination "$dest"
+	done
+
+	if [ -n "${OLD_FORWARD_STATE}" ]; then
+		echo "$OLD_FORWARD_STATE" > /proc/sys/net/ipv4/ip_forward
+	fi
+}
+
+function cleanup_pid {
+	pid="$1"
+	name="$2"
+	if [ -n "$pid" ]; then
+		timer=0
+		while [ -d "/proc/$pid" ]; do
+		    if   [ "$timer" -eq 0 ]; then
+		    	echo "Killing ${name}"
+		    	kill "$pid"
+		    elif [ "$timer" -gt 50 ]; then
+			echo "Terminating ${name}"
+			kill -9 "$pid"
+		    elif [ "$timer" -gt 55 ]; then
+			echo "Problem terminating ${name}"
+			break
+		    fi
+		    sleep 0.1
+		    timer=$[timer+1]
+		done
+	fi
+}
+
+function cleanup {
+	set +e
+
+	cleanup_pid "$HOSTAPD_PID" "hostapd"
+
+	cleanup_pid "$DNSMASQ_PID" "dnsmasq"
+
+	unmasquerade
+
+	del_ap_iface 
+}
+
+function main {
+	trap cleanup EXIT
+
+	create_ap_iface
+
+	masquerade
+
+	# TODO: Redirect logging
+	exec 3>&1 # dnsmasq STDOUT
+	exec 4>&2 # dnsmasq STDERR
+	exec 5>&1 # hostapd STDOUT
+	exec 6>&2 # hostapd STDERR
+
+	dnsmasq -d -C <(dnsmasq_config) 2>&3 >&4 &
+	export DNSMASQ_PID="$!"
+
+	sleep 1
+
+	hostapd <(hostapd_config) 2>&5 >&6 &
+	export HOSTAPD_PID="$!"
+
+	while sleep 1; do
+		if [ ! -d /proc/$DNSMASQ_PID ]; then
+			exit 1
+		fi
+		if [ ! -d /proc/$DNSMASQ_PID ]; then
+			exit 1
+		fi
+		
+	done
+}
+
+#set -o errexit -o noclobber -o nounset -o pipefail
+eval set -- "$(getopt -n "${PROG_NAME}" \
+	-l "phy:,list-phy,net,redirect,verbose,cleanup,help,disable-dhcp,disable-dns" \
+	-o "p:,R:,l,n:,C,v,h,?" -- "$@")"
+
+while [ ! -z "$1" ]; do
+	option=$1 ; shift
+	case "$option" in
+		-p|--phy)
+			PHY="$1" ; shift
+		  ;;
+		-a|--ap)
+			AP="$1" ; shift
+		  ;;
+		-s|--ssid)
+			SSID="$1" ; shift
+		  ;;
+		-p|--password)
+			PASS="$1" ; shift
+		  ;;
+		-n|--net)
+			NET="$1" ; shift
+		  ;;
+		-R|--redirect)
+			if ! ( echo "$1" | grep -Pq '^(?:[^:]+:)?[^:]+:[^:]+:[^:]+$' ) ; then
+				echo "Invalid redirect syntax '$1'" >&2
+				usage
+				exit 1
+			fi
+			REDIRECT=( "${REDIRECT[@]}" "$1" ); shift
+		  ;;
+		-v|--verbose)
+			VERBOSE=$[VERBOSE+1]
+			if [ $VERBOSE -gt 0 ]; then
+				set -x
+			fi
+		  ;;
+		--)
+			main
+			exit 0
+		  ;;
+		-C|--cleanup)
+			cleanup
+			exit 0
+		  ;;
+		-l|--list-phy)
+			iw phy |grep ^Wiphy | awk '{print $2}'
+			exit 0
+		  ;;
+		--disable-dhcp)
+			DISABLE_DHCP=1
+		  ;;
+		--disable-dns)
+			DISABLE_DNS=1
+		  ;;
+		-?|-h|--help)
+			echo "USAGE $1 $2"
+			usage
+			exit 0
+		  ;;
+		
+	esac
+done
+
