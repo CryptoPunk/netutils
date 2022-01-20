@@ -20,11 +20,14 @@ Mandatory arguments to long options are mandatory for short options too.
   -p, --password=PASS	Use password PASS to secure the AP. 
 			  default: MonkeyVSRobot
 
-  -R, --redirect=[HOST:]PORT:REDIRHOST:REDIRPORT
-			Redirect traffic going to HOST:PORT to REDIRHOST:REDIRPORT.
-			If HOST is not specified, all traffic to PORT is redirected to REDIRHOST:REDIRPORT
+  -R, --redirect=[HOST:]PORT:RHOST:RPORT
+			Redirect traffic going to HOST:PORT to RHOST:RPORT.
+			If HOST is not specified, all traffic to PORT is 
+			redirected to RHOST:RPORT
 			
-  -C, --cleanup		Run cleanup again, useful if interfaces get left behind after exiting uncleanly
+  -C, --cleanup		Run cleanup again, useful if interfaces get left behind
+			after exiting uncleanly
+
   -n, --net=IP/CIDR	Use the IP and CIDR range on the AP network.
 			  default: 192.168.77.1/24
   -N, --NAT=IFACE	Use IFACE as the outbound NAT interface
